@@ -1,9 +1,12 @@
 import os
 import json
 import boto3
-from typing import List, Dict, Any,Optional,Tuple
-from collections import defaultdict,deque
-from functools import lru_cache
+from typing import List, Dict, Any, Optional, Tuple
+from collections import defaultdict, deque
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 class TariffSearchService:
     def __init__(self):
@@ -13,7 +16,6 @@ class TariffSearchService:
             raise ValueError("環境変数 S3_BUCKET_NAME が設定されていません")
         self.data_prefix = "tariffdata/"
 
-        # S3クライアントの初期化を簡素化
         self.aws_region = os.environ.get('AWS_REGION', 'us-west-2')
         self.s3_client = boto3.client('s3', region_name=self.aws_region)
 

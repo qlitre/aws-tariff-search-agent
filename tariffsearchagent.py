@@ -1,7 +1,15 @@
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from strands import Agent, tool
+from strands.models import BedrockModel
 from tariff_service import TariffSearchService
+from pathlib import Path
 import json
+import logging
+import boto3
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # タリフ検索サービスのインスタンス（遅延初期化）
 _search_service = None
@@ -58,47 +66,64 @@ def search_tariff_by_keywords(keywords: str) -> str:
         }, ensure_ascii=False, indent=2)
 
 
-SYSTEM_PROMPT = """
-あなたは日本の関税データを検索する専門エージェントです。
-# 利用可能な機能
-- 関税データ検索: 商品名やキーワードの配列で関税情報を検索できます。
-  - **重要**: ユーザーのメッセージを元に連想される文字列を複数カンマ区切りで渡してください。
-  - 統計コード6桁でも検索が可能です。
-  - 例: 「チューハイの税番を教えて」→ search_tariff_by_keywords(keywords="チューハイ,酒,アルコール,飲料")
+SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.txt").read_text(encoding="utf-8")
 
-# 検索戦略
-1. **初回検索**: ユーザーの質問から複数の関連キーワードを抽出して検索
-   - 商品名だけでなく、カテゴリ、用途、素材などの関連語も含める
-   - より広範な結果を得るために3-5個のキーワードを使用
-
-2. **検索結果がない場合**:
-   - 類似キーワード、上位カテゴリ、別の表現で再検索
-   - 例: 「スマートフォン」→「携帯電話,電話機,通信機器」
-
-3. **検索結果が多すぎる場合** (30件以上):
-   - 結果に含まれる`hitCount`（各キーワードごとのヒット件数）を確認
-   - ヒット数が少ないキーワードに絞って再検索
-   - より具体的なキーワードを使用
-
-# 回答形式
-- 検索結果を分かりやすく整理して提示
-- HSコード、統計コード、税率、単位などの重要情報を明確に表示
-- 必要に応じて関連する法令情報も提供
-"""
-
-app = BedrockAgentCoreApp()
-agent = Agent(
-    tools=[search_tariff_by_keywords],
-    system_prompt=SYSTEM_PROMPT
-)
+app = FastAPI()
 
 
-@app.entrypoint
-def invoke(payload):
-    user_message = payload.get("prompt")
-    result = agent(user_message)
-    return {"result": result.message}
+@app.get("/ping")
+async def ping():
+    """AgentCore required health check"""
+    return {"status": "healthy"}
+
+
+@app.post("/invocations")
+async def invocations(request: Request):
+    body = await request.body()
+    request_data = json.loads(body.decode())
+
+    # promptはStrandsContentBlock[]形式で来る
+    prompt = request_data.get("prompt", [])
+    model_info = request_data.get("model", {})
+
+    # content blockのリストをStrandsが扱える形式に変換
+    if isinstance(prompt, list):
+        processed_prompt = ''.join([
+            block.get('text', '') for block in prompt
+            if isinstance(block, dict)
+        ])
+    else:
+        processed_prompt = str(prompt)
+
+    model_id = model_info.get("modelId", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    region = model_info.get("region", "us-west-2")
+
+    bedrock_model = BedrockModel(
+        model_id=model_id,
+        boto_session=boto3.Session(region_name=region),
+    )
+
+    agent = Agent(
+        tools=[search_tariff_by_keywords],
+        system_prompt=SYSTEM_PROMPT,
+        model=bedrock_model,
+    )
+
+    async def generate():
+        try:
+            async for event in agent.stream_async(processed_prompt):
+                if "event" in event:
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
+        except Exception as e:
+            logger.error(f"Error: {e}", exc_info=True)
+            yield json.dumps({
+                "event": {"internalServerException": {"message": str(e)}}
+            }, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
-    app.run()
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="warning", access_log=False)
